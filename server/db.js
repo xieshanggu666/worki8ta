@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-export const db = new DatabaseSync(path.join(__dirname, 'farm.db'))
+export const db = new DatabaseSync(process.env.FARM_DB_PATH || path.join(__dirname, 'farm.db'))
 
 // 启用基本约束
 db.exec('PRAGMA foreign_keys = ON;')
@@ -137,6 +137,18 @@ CREATE TABLE IF NOT EXISTS production_jobs (
   enqueue_abs INTEGER NOT NULL,         -- 排产时的绝对天
   cancel_abs INTEGER DEFAULT NULL,      -- 取消时的绝对天（NULL 未取消）
   status TEXT NOT NULL DEFAULT 'running' -- running/done/canceled/collected
+);
+
+-- 工单逐批次投料明细：取消退料时按批次原样退回实际投入的物品
+-- （同本源配方可能消耗杂交品种作物，不能统一退成基础作物）
+CREATE TABLE IF NOT EXISTS production_inputs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER NOT NULL,
+  batch INTEGER NOT NULL,               -- 批次序号（0 起，串行加工顺序）
+  item_id TEXT NOT NULL,                -- 实际投入物品（crop-5 / crop-v1000 / p-cow ...）
+  name TEXT NOT NULL,
+  cat TEXT NOT NULL,
+  qty INTEGER NOT NULL
 );
 
 -- ===== 杂交育种 =====

@@ -186,8 +186,10 @@ export const useGameStore = defineStore('game', {
       try {
         const r = await api('/production/cancel', 'POST', { id })
         await this.load()
-        if (r.refundBatches > 0) this.showToast(`已取消，退回 ${r.refundBatches} 批原料`, 'info')
-        else this.showToast('已取消（无未开工批次可退料）', 'info')
+        if (r.refundBatches > 0) {
+          const text = (r.refunds || []).map((x) => `${x.name}×${x.qty}`).join('、')
+          this.showToast(`已取消，退回 ${r.refundBatches} 批原料${text ? `：${text}` : ''}`, 'info')
+        } else this.showToast('已取消（无未开工批次可退料）', 'info')
       } catch (e) { this.showToast(e.message, 'warn') }
     },
     // 完工入库：传 id 领单个，不传一键全领

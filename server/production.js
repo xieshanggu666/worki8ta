@@ -1,5 +1,7 @@
 import { db } from './db.js'
 
+export { db }
+
 // ===== 配方表（以服务端为准，前端仅做展示）=====
 // days：每批耗时（游戏天）；needLv：加工坊等级要求
 // baseCrop：本源基础作物 id；设置后该配方可消耗任意同本源的杂交品种作物（贯通新品种加工）
@@ -77,28 +79,32 @@ function recipeStock(r) {
   }
   return total
 }
-// 按本源扣减原料：先消耗基础作物，再按品种代数从低到高（优先普通品种）
+// 按本源扣减原料：先消耗基础作物，再按品种代数从低到高（优先普通品种）。
+// 返回实际扣减明细 [{ itemId, name, cat, qty }]，用于按批次落库投料来源、取消时原样退料。
 function consumeCropByBase(baseId, need) {
   let remain = need
-  const base = q1('SELECT qty FROM inventory WHERE item_id=?', 'crop-' + baseId)
-  if (base) {
-    const take = Math.min(remain, base.qty)
-    run('UPDATE inventory SET qty=qty-? WHERE item_id=?', take, 'crop-' + baseId)
+  const taken = []
+  const grab = (row, itemId) => {
+    if (remain <= 0 || !row || row.qty <= 0) return
+    const take = Math.min(remain, row.qty)
+    run('UPDATE inventory SET qty=qty-? WHERE id=?', take, row.id)
     remain -= take
+    taken.push({ itemId, name: row.name, cat: row.cat, qty: take })
   }
+  const base = q1('SELECT id,name,cat,qty FROM inventory WHERE item_id=?', 'crop-' + baseId)
+  grab(base, 'crop-' + baseId)
   if (remain > 0) {
-    const vars = q(`SELECT i.id, i.qty FROM inventory i
+    const vars = q(`SELECT i.id AS iid, i.name AS name, i.cat AS cat, i.qty AS qty, v.id AS vid
+                    FROM inventory i
                     JOIN crop_varieties v ON i.item_id = 'crop-v' || v.id
                     WHERE v.base_id=? AND i.qty>0 ORDER BY v.gen ASC, v.id ASC`, baseId)
     for (const s of vars) {
       if (remain <= 0) break
-      const take = Math.min(remain, s.qty)
-      run('UPDATE inventory SET qty=qty-? WHERE id=?', take, s.id)
-      remain -= take
+      grab({ id: s.iid, name: s.name, cat: s.cat, qty: s.qty }, 'crop-v' + s.vid)
     }
   }
   cleanEmpty()
-  return need - remain
+  return taken
 }
 function addInv(itemId, name, cat, n) {
   const row = q1('SELECT qty FROM inventory WHERE item_id=?', itemId)
@@ -107,6 +113,36 @@ function addInv(itemId, name, cat, n) {
 }
 function cleanEmpty() {
   db.exec('DELETE FROM inventory WHERE qty<=0')
+}
+
+// 把扣减明细（物品可能跨品种连续消耗）按串行加工顺序切成每批 consume 个的逐批投料记录。
+// 批次越早越早开工；取消时未开工的是序号靠后的批次，必须按这些批次的实际物品退回。
+function splitIntoBatches(taken, batches, consumePerBatch) {
+  const rows = []
+  let b = 0
+  let inBatch = 0
+  for (const t of taken) {
+    let left = t.qty
+    while (left > 0) {
+      if (b >= batches) break
+      const slot = consumePerBatch - inBatch
+      const n = Math.min(slot, left)
+      const last = rows[rows.length - 1]
+      if (last && last.batch === b && last.itemId === t.itemId) last.qty += n
+      else rows.push({ batch: b, itemId: t.itemId, name: t.name, cat: t.cat, qty: n })
+      left -= n
+      inBatch += n
+      if (inBatch >= consumePerBatch) { b += 1; inBatch = 0 }
+    }
+  }
+  return rows
+}
+
+function recordInputs(jobId, batchRows) {
+  const stmt = db.prepare(
+    'INSERT INTO production_inputs (job_id,batch,item_id,name,cat,qty) VALUES (?,?,?,?,?,?)'
+  )
+  for (const r of batchRows) stmt.run(jobId, r.batch, r.itemId, r.name, r.cat, r.qty)
 }
 
 // 截至 absAbs 时，某工单已完工的批次数（取消后不再增加）
@@ -224,10 +260,18 @@ export function enqueueJob({ recipeId, qty, millLevel, currentAbs }) {
   if (recipeStock(r) < need) throw Object.assign(new Error(`原料不足：需要 ${r.fromName} ×${need}`), { status: 400 })
   db.exec('BEGIN IMMEDIATE')
   try {
-    if (r.baseCrop) consumeCropByBase(r.baseCrop, need)
+    let taken
+    if (r.baseCrop) taken = consumeCropByBase(r.baseCrop, need)
     else {
+      const row = q1('SELECT name,cat,qty FROM inventory WHERE item_id=?', r.from)
       run('UPDATE inventory SET qty=qty-? WHERE item_id=?', need, r.from)
       cleanEmpty()
+      taken = [{
+        itemId: r.from,
+        name: row?.name || r.fromName,
+        cat: row?.cat || r.fromCat,
+        qty: need
+      }]
     }
     const res = run(
       `INSERT INTO production_jobs
@@ -237,6 +281,7 @@ export function enqueueJob({ recipeId, qty, millLevel, currentAbs }) {
       r.id, r.name, r.result, r.resultName, r.resultCat,
       r.from, r.fromName, r.fromCat, r.consume, r.gain, r.days, n, currentAbs
     )
+    recordInputs(res.lastInsertRowid, splitIntoBatches(taken, n, r.consume))
     db.exec('COMMIT')
     return { ok: true, id: res.lastInsertRowid }
   } catch (e) {
@@ -262,9 +307,28 @@ export function cancelJob({ id, currentAbs }) {
   try {
     run('UPDATE production_jobs SET status=\'canceled\', cancel_abs=?, finished=? WHERE id=?',
       currentAbs, finishedBatches, id)
-    if (refundBatches > 0) addInv(j.from_id, j.from_name, j.from_cat, j.consume * refundBatches)
+    let refunds = []
+    if (refundBatches > 0) {
+      // 未开工批次 = 串行队列尾部批次，按其排产时落库的实际投料来源原样退回
+      // （可能是杂交品种作物，不能统一退成配方的本源基础作物）
+      const rows = q(
+        `SELECT item_id, name, cat, SUM(qty) AS qty FROM production_inputs
+          WHERE job_id=? AND batch>=? GROUP BY item_id, name, cat`,
+        id, startedBatches
+      )
+      if (rows.length) {
+        for (const r0 of rows) {
+          addInv(r0.item_id, r0.name, r0.cat, r0.qty)
+          refunds.push({ itemId: r0.item_id, name: r0.name, qty: r0.qty })
+        }
+      } else {
+        // 旧存档工单没有逐批投料明细：退回配方记录的原料
+        addInv(j.from_id, j.from_name, j.from_cat, j.consume * refundBatches)
+        refunds = [{ itemId: j.from_id, name: j.from_name, qty: j.consume * refundBatches }]
+      }
+    }
     db.exec('COMMIT')
-    return { ok: true, refundBatches, finishedBatches }
+    return { ok: true, refundBatches, finishedBatches, refunds }
   } catch (e) {
     try { db.exec('ROLLBACK') } catch { /* 事务可能已结束，忽略 */ }
     throw e
