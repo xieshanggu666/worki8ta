@@ -181,13 +181,15 @@ export const useGameStore = defineStore('game', {
         this.showToast(`已排产 ${qty} 批，开工后按天自动推进`, 'success')
       } catch (e) { this.showToast(e.message, 'warn'); throw e }
     },
-    // 取消工单（退未开工批次的原料）
+    // 取消工单（退未开工批次的原料，按实际投料原样退回杂交品种）
     async cancelProduction(id) {
       try {
         const r = await api('/production/cancel', 'POST', { id })
         await this.load()
-        if (r.refundBatches > 0) this.showToast(`已取消，退回 ${r.refundBatches} 批原料`, 'info')
-        else this.showToast('已取消（无未开工批次可退料）', 'info')
+        if (r.refundBatches > 0) {
+          const items = (r.refunds || []).map((it) => `${it.name}×${it.qty}`).join('、')
+          this.showToast(`已取消，退回 ${r.refundBatches} 批原料：${items}`, 'info')
+        } else this.showToast('已取消（无未开工批次可退料）', 'info')
       } catch (e) { this.showToast(e.message, 'warn') }
     },
     // 完工入库：传 id 领单个，不传一键全领

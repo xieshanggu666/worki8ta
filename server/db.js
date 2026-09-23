@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS production_jobs (
   finished INTEGER NOT NULL DEFAULT 0,  -- 已完工批次数（跨天结算时落库）
   enqueue_abs INTEGER NOT NULL,         -- 排产时的绝对天
   cancel_abs INTEGER DEFAULT NULL,      -- 取消时的绝对天（NULL 未取消）
+  inputs TEXT DEFAULT NULL,             -- 按批次登记的实际投料明细（JSON：每批 [{itemId,name,cat,qty}]，取消时原样退回）
   status TEXT NOT NULL DEFAULT 'running' -- running/done/canceled/collected
 );
 
@@ -208,4 +209,11 @@ if (!plotCols.includes('irr_priority')) {
 // 兼容旧存档：plots 增加目标水分（灌溉时浇到该水位为止；0 表示不自动浇水，默认 100 与旧行为一致）
 if (!plotCols.includes('irr_target')) {
   db.exec('ALTER TABLE plots ADD COLUMN irr_target INTEGER NOT NULL DEFAULT 100')
+}
+
+// 兼容旧存档：production_jobs 增加按批次登记的实际投料明细
+// （修复取消工单把杂交品种作物退成基础作物的问题；旧工单该列为 NULL，退料时回退为按配方本源退）
+const jobCols = db.prepare('PRAGMA table_info(production_jobs)').all().map((c) => c.name)
+if (!jobCols.includes('inputs')) {
+  db.exec('ALTER TABLE production_jobs ADD COLUMN inputs TEXT DEFAULT NULL')
 }

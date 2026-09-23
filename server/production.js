@@ -78,27 +78,58 @@ function recipeStock(r) {
   return total
 }
 // 按本源扣减原料：先消耗基础作物，再按品种代数从低到高（优先普通品种）
+// 返回实际扣减明细 [{itemId,name,cat,qty}]（杂交品种可能是基础作物也可能是杂交作物，取消退料必须原样退回）
 function consumeCropByBase(baseId, need) {
   let remain = need
-  const base = q1('SELECT qty FROM inventory WHERE item_id=?', 'crop-' + baseId)
-  if (base) {
-    const take = Math.min(remain, base.qty)
-    run('UPDATE inventory SET qty=qty-? WHERE item_id=?', take, 'crop-' + baseId)
-    remain -= take
+  const taken = []
+  // 从指定库存行扣 n 个并登记实际来源
+  const take = (invId, itemId, name, cat, qty) => {
+    const n = Math.min(remain, qty)
+    if (n <= 0) return
+    run('UPDATE inventory SET qty=qty-? WHERE id=?', n, invId)
+    taken.push({ itemId, name, cat, qty: n })
+    remain -= n
   }
+  const base = q1('SELECT * FROM inventory WHERE item_id=?', 'crop-' + baseId)
+  if (base) take(base.id, 'crop-' + baseId, base.name, base.cat, base.qty)
   if (remain > 0) {
-    const vars = q(`SELECT i.id, i.qty FROM inventory i
+    const vars = q(`SELECT i.id AS inv_id, i.item_id, i.name, i.cat, i.qty
+                    FROM inventory i
                     JOIN crop_varieties v ON i.item_id = 'crop-v' || v.id
                     WHERE v.base_id=? AND i.qty>0 ORDER BY v.gen ASC, v.id ASC`, baseId)
     for (const s of vars) {
       if (remain <= 0) break
-      const take = Math.min(remain, s.qty)
-      run('UPDATE inventory SET qty=qty-? WHERE id=?', take, s.id)
-      remain -= take
+      take(s.inv_id, s.item_id, s.name, s.cat, s.qty)
     }
   }
   cleanEmpty()
-  return need - remain
+  return { taken, got: need - remain }
+}
+// 扣减单一原料（非杂交贯通配方），返回实际扣减明细
+function consumeItem(itemId, need) {
+  const row = q1('SELECT * FROM inventory WHERE item_id=?', itemId)
+  const n = Math.min(need, row?.qty || 0)
+  if (n <= 0) return { taken: [], got: 0 }
+  run('UPDATE inventory SET qty=qty-? WHERE id=?', n, row.id)
+  cleanEmpty()
+  return { taken: [{ itemId, name: row.name, cat: row.cat, qty: n }], got: n }
+}
+// 把按消耗顺序排列的扣减明细按每批 consume 个切分，登记到每一批
+// （取消时按批次退还：机器先开的批次先投料，故未开工的尾部批次要原样拿回自己的投料）
+function splitIntoBatches(taken, perBatch, batches) {
+  const flat = []
+  for (const t of taken) for (let i = 0; i < t.qty; i++) flat.push(t)
+  const result = []
+  for (let b = 0; b < batches; b++) {
+    const map = new Map()
+    for (const t of flat.slice(b * perBatch, (b + 1) * perBatch)) {
+      const cur = map.get(t.itemId)
+      if (cur) cur.qty += 1
+      else map.set(t.itemId, { itemId: t.itemId, name: t.name, cat: t.cat, qty: 1 })
+    }
+    result.push([...map.values()])
+  }
+  return result
 }
 function addInv(itemId, name, cat, n) {
   const row = q1('SELECT qty FROM inventory WHERE item_id=?', itemId)
@@ -224,18 +255,19 @@ export function enqueueJob({ recipeId, qty, millLevel, currentAbs }) {
   if (recipeStock(r) < need) throw Object.assign(new Error(`原料不足：需要 ${r.fromName} ×${need}`), { status: 400 })
   db.exec('BEGIN IMMEDIATE')
   try {
-    if (r.baseCrop) consumeCropByBase(r.baseCrop, need)
-    else {
-      run('UPDATE inventory SET qty=qty-? WHERE item_id=?', need, r.from)
-      cleanEmpty()
-    }
+    const { taken, got } = r.baseCrop
+      ? consumeCropByBase(r.baseCrop, need)
+      : consumeItem(r.from, need)
+    if (got < need) throw Object.assign(new Error(`原料不足：需要 ${r.fromName} ×${need}`), { status: 400 })
+    // 按批次登记实际投料来源（基础作物/杂交品种逐项记录），取消未开工批次时原样退回
+    const inputs = JSON.stringify(splitIntoBatches(taken, r.consume, n))
     const res = run(
       `INSERT INTO production_jobs
        (recipe_id,recipe_name,result_id,result_name,result_cat,from_id,from_name,from_cat,
-        consume,gain,days,qty,finished,enqueue_abs,status)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,'running')`,
+        consume,gain,days,qty,finished,enqueue_abs,inputs,status)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,'running')`,
       r.id, r.name, r.result, r.resultName, r.resultCat,
-      r.from, r.fromName, r.fromCat, r.consume, r.gain, r.days, n, currentAbs
+      r.from, r.fromName, r.fromCat, r.consume, r.gain, r.days, n, currentAbs, inputs
     )
     db.exec('COMMIT')
     return { ok: true, id: res.lastInsertRowid }
@@ -247,6 +279,8 @@ export function enqueueJob({ recipeId, qty, millLevel, currentAbs }) {
 
 // 取消工单：退还尚未开工批次的原料；已开工（含加工中）批次不退料，
 // 已完工批次保留成品待入库，加工中批次随取消作废。
+// 退料按排产时逐批登记的实际投料（可能含杂交品种作物）原样退回，
+// 而不是统一退成配方本源基础作物；旧工单无登记时回退按配方原料退。
 export function cancelJob({ id, currentAbs }) {
   const j = q1('SELECT * FROM production_jobs WHERE id=?', id)
   if (!j) throw Object.assign(new Error('工单不存在'), { status: 404 })
@@ -258,13 +292,38 @@ export function cancelJob({ id, currentAbs }) {
   const startedBatches = startedBatchesAt(cur, currentAbs)
   const refundBatches = Math.max(0, j.qty - startedBatches)
 
+  // 机器按批次序号顺序加工，未开工的是尾部 refundBatches 批（下标 startedBatches..qty-1）
+  let refundItems = []
+  if (j.inputs) {
+    try {
+      const perBatch = JSON.parse(j.inputs)
+      if (Array.isArray(perBatch)) {
+        for (const inputs of perBatch.slice(startedBatches, j.qty)) {
+          for (const it of inputs || []) refundItems.push(it)
+        }
+      }
+    } catch { /* 登记损坏则回退旧逻辑 */ refundItems = [] }
+  }
+  const fallback = !j.inputs || refundItems.length === 0
+  if (fallback && refundBatches > 0) {
+    refundItems = [{ itemId: j.from_id, name: j.from_name, cat: j.from_cat, qty: j.consume * refundBatches }]
+  }
+  // 合并同一物品后逐条退回
+  const merged = new Map()
+  for (const it of refundItems) {
+    const cur2 = merged.get(it.itemId)
+    if (cur2) cur2.qty += it.qty
+    else merged.set(it.itemId, { ...it })
+  }
+  const refunds = [...merged.values()].filter((it) => it.qty > 0)
+
   db.exec('BEGIN IMMEDIATE')
   try {
     run('UPDATE production_jobs SET status=\'canceled\', cancel_abs=?, finished=? WHERE id=?',
       currentAbs, finishedBatches, id)
-    if (refundBatches > 0) addInv(j.from_id, j.from_name, j.from_cat, j.consume * refundBatches)
+    for (const it of refunds) addInv(it.itemId, it.name, it.cat, it.qty)
     db.exec('COMMIT')
-    return { ok: true, refundBatches, finishedBatches }
+    return { ok: true, refundBatches, finishedBatches, refunds }
   } catch (e) {
     try { db.exec('ROLLBACK') } catch { /* 事务可能已结束，忽略 */ }
     throw e
